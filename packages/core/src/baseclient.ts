@@ -65,8 +65,8 @@ export abstract class BaseClient<B extends Backend, O extends Options> implement
   /** Array of used integrations. */
   protected _integrations: IntegrationIndex = {};
 
-  /** Is the client still processing a call? */
-  protected _processing: boolean = false;
+  /** Number of events client currently processing */
+  protected _processing: number = 0;
 
   /**
    * Initializes this client instance.
@@ -89,14 +89,17 @@ export abstract class BaseClient<B extends Backend, O extends Options> implement
   // eslint-disable-next-line @typescript-eslint/no-explicit-any, @typescript-eslint/explicit-module-boundary-types
   public captureException(exception: any, hint?: EventHint, scope?: Scope): string | undefined {
     let eventId: string | undefined = hint && hint.event_id;
-    this._processing = true;
 
     // eslint-disable-next-line @typescript-eslint/no-floating-promises
-    this._getBackend()
-      .eventFromException(exception, hint)
-      .then(event => {
-        eventId = this.captureEvent(event, hint, scope);
-      });
+    this._process(
+      this._getBackend()
+        .eventFromException(exception, hint)
+        .then(event =>
+          this._captureEvent(event, hint, scope).then(result => {
+            eventId = result;
+          }),
+        ),
+    );
 
     return eventId;
   }
@@ -106,16 +109,19 @@ export abstract class BaseClient<B extends Backend, O extends Options> implement
    */
   public captureMessage(message: string, level?: Severity, hint?: EventHint, scope?: Scope): string | undefined {
     let eventId: string | undefined = hint && hint.event_id;
-    this._processing = true;
 
     const promisedEvent = isPrimitive(message)
       ? this._getBackend().eventFromMessage(`${message}`, level, hint)
       : this._getBackend().eventFromException(message, hint);
 
     // eslint-disable-next-line @typescript-eslint/no-floating-promises
-    promisedEvent.then(event => {
-      eventId = this.captureEvent(event, hint, scope);
-    });
+    this._process(
+      promisedEvent.then(event =>
+        this._captureEvent(event, hint, scope).then(result => {
+          eventId = result;
+        }),
+      ),
+    );
 
     return eventId;
   }
@@ -125,18 +131,13 @@ export abstract class BaseClient<B extends Backend, O extends Options> implement
    */
   public captureEvent(event: Event, hint?: EventHint, scope?: Scope): string | undefined {
     let eventId: string | undefined = hint && hint.event_id;
-    this._processing = true;
 
-    this._processEvent(event, hint, scope)
-      .then(finalEvent => {
+    this._process(
+      this._captureEvent(event, hint, scope).then(result => {
         // We need to check for finalEvent in case beforeSend returned null
-        eventId = finalEvent && finalEvent.event_id;
-        this._processing = false;
-      })
-      .then(null, reason => {
-        logger.error(reason);
-        this._processing = false;
-      });
+        eventId = result;
+      }),
+    );
 
     return eventId;
   }
@@ -209,7 +210,7 @@ export abstract class BaseClient<B extends Backend, O extends Options> implement
       clearInterval(interval);
 
       interval = (setInterval(() => {
-        if (!this._processing) {
+        if (this._processing == 0) {
           resolve({
             interval,
             ready: true,
@@ -235,6 +236,22 @@ export abstract class BaseClient<B extends Backend, O extends Options> implement
   /** Determines whether this SDK is enabled and a valid Dsn is present. */
   protected _isEnabled(): boolean {
     return this.getOptions().enabled !== false && this._dsn !== undefined;
+  }
+
+  protected _captureEvent(event: Event, hint?: EventHint, scope?: Scope): PromiseLike<string | undefined> {
+    let eventId: string | undefined = hint && hint.event_id;
+
+    return this._processEvent(event, hint, scope).then(
+      finalEvent => {
+        // We need to check for finalEvent in case beforeSend returned null
+        eventId = (finalEvent && finalEvent.event_id) || undefined;
+        return eventId;
+      },
+      reason => {
+        logger.error(reason);
+        return undefined;
+      },
+    );
   }
 
   /**
@@ -405,7 +422,7 @@ export abstract class BaseClient<B extends Backend, O extends Options> implement
    * @param scope A scope containing event metadata.
    * @returns A SyncPromise that resolves with the event or rejects in case event was/will not be send.
    */
-  protected _processEvent(event: Event, hint?: EventHint, scope?: Scope): PromiseLike<Event> {
+  protected _processEvent(event: Event, hint?: EventHint, scope?: Scope): PromiseLike<Event | null> {
     // eslint-disable-next-line @typescript-eslint/unbound-method
     const { beforeSend, sampleRate } = this.getOptions();
 
@@ -494,5 +511,22 @@ export abstract class BaseClient<B extends Backend, O extends Options> implement
       .then(null, e => {
         reject(`beforeSend rejected with ${e}`);
       });
+  }
+
+  /**
+   * Occupies the client with processing and event
+   */
+  private _process<T>(promise: PromiseLike<T>): PromiseLike<T> {
+    this._processing++;
+    return promise.then(
+      value => {
+        this._processing--;
+        return value;
+      },
+      reason => {
+        this._processing--;
+        return reason;
+      },
+    );
   }
 }
